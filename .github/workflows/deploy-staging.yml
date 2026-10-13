@@ -1,0 +1,367 @@
+name: Staging CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  # 合并前门禁：PR 上只跑 test job —— build-and-deploy 被
+  # `if: github.ref == 'refs/heads/main'` 挡住，PR 的 ref 是
+  # refs/pull/N/merge，天然不会碰 staging。
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install aiosqlite pytest pytest-asyncio pytest-cov httpx respx fakeredis sqlalchemy ruff mypy
+
+      - name: Run Tests
+        run: |
+          # 真链路模块（AgentOS 客户端/模型/交易流）+ 策略容器模块强制 100% 行+分支覆盖；
+          # live 段无 AGENT_CORE_ACTOR_TOKEN 自动 skip。
+          python -m pytest -v --cov=app.tools.agentos --cov=app.strategy --cov=app.api.strategy --cov-branch --cov-fail-under=100
+          ruff check .
+          mypy app
+
+  build-and-deploy:
+    name: Build & Deploy to Staging (174.138.21.66)
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image (Validation)
+        run: |
+          docker build -t agentos-agent-runtime:staging .
+
+      - name: Upload exact release source to staging
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: 174.138.21.66
+          username: sxy
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          source: "app,Dockerfile,docker-compose.yml,pyproject.toml,uv.lock"
+          target: "/home/sxy/releases/${{ github.sha }}"
+          overwrite: true
+
+      - name: Deploy to Staging Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          # 文本推理统一网关（自建 New API 中转站）。三项都是 real 模式必填：
+          # 任一注入空值都会让 Settings() 抛错、整个服务起不来。
+          LLM_BASE_URL: ${{ secrets.AGENT_LLM_BASE_URL || vars.AGENT_LLM_BASE_URL }}
+          LLM_KEY: ${{ secrets.AGENT_LLM_API_KEY }}
+          LLM_MODEL: ${{ vars.AGENT_LLM_MODEL || secrets.AGENT_LLM_MODEL }}
+          INVESTMENT_EXPERT_LLM_MODEL: ${{ vars.AGENT_INVESTMENT_EXPERT_LLM_MODEL || 'deepseek-v4-flash-max' }}
+          # 实时语音渠道开关。以仓库 vars 为唯一事实来源，缺省 gemini_live ——
+          # 切回 volc_rtc 或切 openai 只改这个 var，不用改代码也不用发 PR，
+          # 更不用两个 PR 抢改同一行。
+          VOICE_PROVIDER: ${{ vars.AGENT_REALTIME_VOICE_PROVIDER || 'gemini_live' }}
+          # 可并行开放的语音能力；缺省仅开启主 Provider，保持旧部署兼容。
+          ENABLED_VOICE_PROVIDERS: ${{ vars.AGENT_ENABLED_VOICE_PROVIDERS || vars.AGENT_REALTIME_VOICE_PROVIDER || 'gemini_live' }}
+          # Gemini Live 原生音频。Key 只能走 Actions Secret；endpoint / model
+          # 允许被仓库 vars 覆盖，未设置时用这里的缺省值（不读服务器 .env 残留）。
+          GEMINI_KEY: ${{ secrets.AGENT_GEMINI_API_KEY }}
+          GEMINI_BASE_URL: ${{ vars.AGENT_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com' }}
+          GEMINI_LIVE_MODEL: ${{ vars.AGENT_GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview' }}
+          # 02 方案流水线（VOICE_PROVIDER=pipeline）：LLM 出文本 + 火山 TTS 出声音。
+          # Key 复用下面已有的 HUOCHAN_KEY；音色和语速允许仓库 vars 覆盖 ——
+          # 换音色是听感偏好，应该改 var 重跑部署，不该为它发 PR。
+          HUOCHAN_VOICE_TYPE: ${{ vars.AGENT_HUOCHAN_VOICE_TYPE || 'zh_female_tianmeixiaoyuan_uranus_bigtts' }}
+          HUOCHAN_SPEED_RATIO: ${{ vars.AGENT_HUOCHAN_SPEED_RATIO || '1.15' }}
+          # 品牌名送进 TTS 时替换成的念法（显示文字仍是 YesUP）。豆包 TTS 2.0 不支持
+          # SSML，读音只能靠改写朗读文本，而听感只有真机能判 —— 所以留成 var：
+          # 调读法应该是改变量重跑部署，不该为它发 PR。留空则用代码里的默认值。
+          VOICE_BRAND_SPOKEN_AS: ${{ vars.AGENT_VOICE_BRAND_SPOKEN_AS }}
+          # real 模式必填：缺它 Settings() 直接抛错、容器起不来（不只新闻链路挂）
+          FOLLOWIN_KEY: ${{ secrets.AGENT_FOLLOWIN_API_KEY }}
+          TAVILY_KEY: ${{ secrets.AGENT_TAVILY_API_KEY }}
+          # 新闻后台采集。调参走仓库 vars，不要手改服务器 .env（会造成配置漂移）。
+          # Followin 官方确认 news 工具不限量、不消耗配额，所以每天约 864 次调用无预算风险
+          # （响应里的 limit:100 只作用于 metrics / signal / twitter，二期接那些要重新核算）。
+          NEWS_COLLECT_ENABLED: ${{ vars.AGENT_NEWS_COLLECT_ENABLED || 'true' }}
+          # 上游 limit 上限 50、无分页；media 源实测 2 条/分 → 50 条约 25 分钟耗尽。
+          # 300s 留 5x 余量，不要调到 1500 以上，否则会漏数据。
+          NEWS_COLLECT_INTERVAL: ${{ vars.AGENT_NEWS_COLLECT_INTERVAL_SECONDS || '300' }}
+          # 一次性冷启动预热：首次部署设 true 跑一轮，随后改回 false。
+          # 上游无历史回填能力，这是唯一能缓解首日纵深的手段。
+          NEWS_WARMUP_ON_START: ${{ vars.AGENT_NEWS_WARMUP_ON_START || 'false' }}
+          NEWS_RETENTION_DAYS: ${{ vars.AGENT_NEWS_RETENTION_DAYS || '90' }}
+          CORE_ACTOR_TOKEN: ${{ secrets.AGENT_CORE_ACTOR_TOKEN }}
+          CORE_TIMEOUT_SECONDS: ${{ vars.AGENT_CORE_TIMEOUT_SECONDS || '10' }}
+          CORE_CREDENTIAL_VALIDATION_INTERVAL: ${{ vars.AGENT_CORE_CREDENTIAL_VALIDATION_INTERVAL_SECONDS || '300' }}
+          CORE_CREDENTIAL_EXPIRY_WARNING: ${{ vars.AGENT_CORE_CREDENTIAL_EXPIRY_WARNING_SECONDS || '86400' }}
+          HUOCHAN_KEY: ${{ secrets.AGENT_HUOCHAN_API_KEY }}
+          RTC_APP_ID: ${{ vars.AGENT_RTC_APP_ID }}
+          RTC_APP_KEY: ${{ secrets.AGENT_RTC_APP_KEY }}
+          HUOCHAN_S2S_APP_ID: ${{ vars.AGENT_HUOCHAN_S2S_APP_ID }}
+          HUOCHAN_S2S_TOKEN: ${{ secrets.AGENT_HUOCHAN_S2S_TOKEN }}
+          VOLC_ACCESS_KEY_ID: ${{ secrets.AGENT_VOLC_ACCESS_KEY_ID }}
+          VOLC_SECRET_ACCESS_KEY: ${{ secrets.AGENT_VOLC_SECRET_ACCESS_KEY }}
+          VOLC_CALLBACK_URL: ${{ vars.AGENT_VOLC_CALLBACK_URL }}
+          VOLC_CALLBACK_SECRET: ${{ secrets.AGENT_VOLC_CALLBACK_SECRET }}
+          VOLC_FUNCTION_CALLBACK_URL: ${{ vars.AGENT_VOLC_FUNCTION_CALLBACK_URL }}
+          VOLC_FUNCTION_CALLBACK_SECRET: ${{ secrets.AGENT_VOLC_FUNCTION_CALLBACK_SECRET }}
+          VOLC_ARK_MODEL: ${{ vars.AGENT_VOLC_ARK_MODEL }}
+          VOLC_ARK_ENDPOINT_ID: ${{ vars.AGENT_VOLC_ARK_ENDPOINT_ID }}
+          RT_TOKEN_SECRET: ${{ secrets.AGENT_RT_TOKEN_SECRET }}
+          CORE_BASE_URL: ${{ vars.AGENT_CORE_BASE_URL }}
+          RT_WS_BASE: ${{ vars.AGENT_RT_WS_BASE }}
+          # 全链路追踪。默认开；要临时关掉把仓库 var AGENT_OTEL_ENABLED 设成 false，
+          # 不要手改服务器 .env（下次发布就被覆盖回来）。
+          OTEL_ENABLED: ${{ vars.AGENT_OTEL_ENABLED || 'true' }}
+          OTEL_ENDPOINT: ${{ vars.AGENT_OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces' }}
+        with:
+          host: 174.138.21.66
+          username: sxy
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          envs: RELEASE_SHA,LLM_BASE_URL,LLM_KEY,LLM_MODEL,INVESTMENT_EXPERT_LLM_MODEL,VOICE_PROVIDER,ENABLED_VOICE_PROVIDERS,GEMINI_KEY,GEMINI_BASE_URL,GEMINI_LIVE_MODEL,HUOCHAN_VOICE_TYPE,HUOCHAN_SPEED_RATIO,VOICE_BRAND_SPOKEN_AS,FOLLOWIN_KEY,TAVILY_KEY,NEWS_COLLECT_ENABLED,NEWS_COLLECT_INTERVAL,NEWS_WARMUP_ON_START,NEWS_RETENTION_DAYS,CORE_ACTOR_TOKEN,CORE_TIMEOUT_SECONDS,CORE_CREDENTIAL_VALIDATION_INTERVAL,CORE_CREDENTIAL_EXPIRY_WARNING,HUOCHAN_KEY,RTC_APP_ID,RTC_APP_KEY,HUOCHAN_S2S_APP_ID,HUOCHAN_S2S_TOKEN,VOLC_ACCESS_KEY_ID,VOLC_SECRET_ACCESS_KEY,VOLC_CALLBACK_URL,VOLC_CALLBACK_SECRET,VOLC_FUNCTION_CALLBACK_URL,VOLC_FUNCTION_CALLBACK_SECRET,VOLC_ARK_MODEL,VOLC_ARK_ENDPOINT_ID,RT_TOKEN_SECRET,CORE_BASE_URL,RT_WS_BASE,OTEL_ENABLED,OTEL_ENDPOINT
+          script: |
+            set -eu
+            release_dir="/home/sxy/releases/$RELEASE_SHA"
+            test -f "$release_dir/Dockerfile"
+            test -f "$release_dir/docker-compose.yml"
+            test -d "$release_dir/app"
+            umask 077
+            if [ -f /home/sxy/current/.env ] && [ ! "/home/sxy/current/.env" -ef "$release_dir/.env" ]; then
+              cp /home/sxy/current/.env "$release_dir/.env"
+            elif [ -f /home/sxy/app/.env ] && [ ! "/home/sxy/app/.env" -ef "$release_dir/.env" ]; then
+              cp /home/sxy/app/.env "$release_dir/.env"
+            elif [ ! -f "$release_dir/.env" ]; then
+              touch "$release_dir/.env"
+            fi
+            cd "$release_dir"
+            require_env() {
+              key="$1"
+              value="$2"
+              if [ -z "$value" ]; then
+                echo "Required deployment value is missing: $key" >&2
+                exit 1
+              fi
+            }
+            set_env() {
+              key="$1"
+              value="$2"
+              require_env "$key" "$value"
+              sed -i "/^${key}=/d" .env
+              printf '%s=%s\n' "$key" "$value" >> .env
+            }
+            # 允许为空的配置项：以仓库 vars 为唯一事实来源 —— 未设置时从 .env 里删掉，
+            # 让应用回落到代码里的默认值，而不是保留服务器上手改的残留值。
+            set_env_optional() {
+              key="$1"
+              value="$2"
+              sed -i "/^${key}=/d" .env
+              if [ -n "$value" ]; then
+                printf '%s=%s\n' "$key" "$value" >> .env
+              fi
+            }
+            # Never retain deprecated Core/LLM credentials from a copied server .env.
+            sed -i '/^AGENT_AGENTOS_STAGING_TOKEN=/d' .env
+            sed -i '/^AGENTOS_STAGING_TOKEN=/d' .env
+            sed -i '/^AGENT_STAGING_TOKEN=/d' .env
+            sed -i '/^AGENT_OPENROUTER_/d' .env
+            set_env AGENT_ENV staging
+            set_env AGENT_PROVIDER_MODE real
+            # 选了 gemini_live 却没配 Key，Settings() 会在启动时抛错、容器起不来。
+            # 这一步排在 up -d 之前，所以失败时 staging 仍在跑旧版本。
+            # 用条件校验而不是无条件 set_env：Key 过期或被清空时，只有真正选用
+            # Gemini 的部署才会失败，切回 volc_rtc 的部署不该被它拖住。
+            case ",$ENABLED_VOICE_PROVIDERS," in
+              *,gemini_live,*)
+                if [ -z "$GEMINI_KEY" ]; then
+                  echo "::error title=Gemini 凭证缺失：新代码未上线::AGENT_ENABLED_VOICE_PROVIDERS 启用了 gemini_live 但 AGENT_GEMINI_API_KEY 为空。staging 仍在运行上一个版本。补好 Secret 后重跑本 job。" >&2
+                  exit 1
+                fi
+                ;;
+            esac
+            # 同理：选了 pipeline 却没配火山 TTS Key，Settings() 同样启动即抛错。
+            case ",$ENABLED_VOICE_PROVIDERS," in
+              *,pipeline,*)
+                if [ -z "$HUOCHAN_KEY" ]; then
+                  echo "::error title=火山 TTS 凭证缺失：新代码未上线::AGENT_ENABLED_VOICE_PROVIDERS 启用了 pipeline 但 AGENT_HUOCHAN_API_KEY 为空。staging 仍在运行上一个版本。补好 Secret 后重跑本 job。" >&2
+                  exit 1
+                fi
+                ;;
+            esac
+            set_env AGENT_REALTIME_VOICE_PROVIDER "$VOICE_PROVIDER"
+            set_env AGENT_ENABLED_VOICE_PROVIDERS "$ENABLED_VOICE_PROVIDERS"
+            set_env_optional AGENT_GEMINI_API_KEY "$GEMINI_KEY"
+            set_env_optional AGENT_GEMINI_BASE_URL "$GEMINI_BASE_URL"
+            set_env_optional AGENT_GEMINI_LIVE_MODEL "$GEMINI_LIVE_MODEL"
+            set_env_optional AGENT_HUOCHAN_VOICE_TYPE "$HUOCHAN_VOICE_TYPE"
+            set_env_optional AGENT_HUOCHAN_SPEED_RATIO "$HUOCHAN_SPEED_RATIO"
+            set_env_optional AGENT_VOICE_BRAND_SPOKEN_AS "$VOICE_BRAND_SPOKEN_AS"
+            set_env AGENT_LLM_BASE_URL "$LLM_BASE_URL"
+            set_env AGENT_LLM_API_KEY "$LLM_KEY"
+            set_env AGENT_LLM_MODEL "$LLM_MODEL"
+            set_env_optional AGENT_INVESTMENT_EXPERT_LLM_MODEL "$INVESTMENT_EXPERT_LLM_MODEL"
+            set_env AGENT_FOLLOWIN_API_KEY "$FOLLOWIN_KEY"
+            set_env_optional AGENT_TAVILY_API_KEY "$TAVILY_KEY"
+            set_env AGENT_NEWS_COLLECT_ENABLED "$NEWS_COLLECT_ENABLED"
+            set_env AGENT_NEWS_COLLECT_INTERVAL_SECONDS "$NEWS_COLLECT_INTERVAL"
+            set_env AGENT_NEWS_WARMUP_ON_START "$NEWS_WARMUP_ON_START"
+            set_env AGENT_NEWS_RETENTION_DAYS "$NEWS_RETENTION_DAYS"
+            set_env AGENT_CORE_ACTOR_TOKEN "$CORE_ACTOR_TOKEN"
+            set_env AGENT_CORE_TIMEOUT_SECONDS "$CORE_TIMEOUT_SECONDS"
+            set_env AGENT_CORE_CREDENTIAL_AGENT_ID agent-test-001
+            set_env AGENT_CORE_CREDENTIAL_REQUIRED_SCOPES "market:read,account:read,trade:draft"
+            set_env AGENT_CORE_CREDENTIAL_FORBIDDEN_SCOPES "trade:confirm,trade:execute,withdraw:write,withdrawal:write,transfer:write,funding:write,admin,admin:*"
+            set_env AGENT_CORE_CREDENTIAL_VALIDATION_INTERVAL_SECONDS "$CORE_CREDENTIAL_VALIDATION_INTERVAL"
+            set_env AGENT_CORE_CREDENTIAL_EXPIRY_WARNING_SECONDS "$CORE_CREDENTIAL_EXPIRY_WARNING"
+            set_env AGENT_AGENTOS_DEFAULT_STRATEGY_ID strategy_btc_limit_v1
+            set_env AGENT_HUOCHAN_API_KEY "$HUOCHAN_KEY"
+            set_env AGENT_HUOCHAN_S2S_APP_ID "$HUOCHAN_S2S_APP_ID"
+            set_env AGENT_HUOCHAN_S2S_TOKEN "$HUOCHAN_S2S_TOKEN"
+            set_env AGENT_RTC_APP_ID "$RTC_APP_ID"
+            set_env AGENT_RTC_APP_KEY "$RTC_APP_KEY"
+            set_env AGENT_VOLC_ACCESS_KEY_ID "$VOLC_ACCESS_KEY_ID"
+            set_env AGENT_VOLC_SECRET_ACCESS_KEY "$VOLC_SECRET_ACCESS_KEY"
+            set_env AGENT_VOLC_CALLBACK_URL "$VOLC_CALLBACK_URL"
+            set_env AGENT_VOLC_CALLBACK_SECRET "$VOLC_CALLBACK_SECRET"
+            set_env AGENT_VOLC_FUNCTION_CALLBACK_URL "$VOLC_FUNCTION_CALLBACK_URL"
+            set_env AGENT_VOLC_FUNCTION_CALLBACK_SECRET "$VOLC_FUNCTION_CALLBACK_SECRET"
+            set_env AGENT_VOLC_ARK_MODEL "$VOLC_ARK_MODEL"
+            set_env AGENT_VOLC_ARK_ENDPOINT_ID "$VOLC_ARK_ENDPOINT_ID"
+            set_env AGENT_RT_TOKEN_SECRET "$RT_TOKEN_SECRET"
+            set_env AGENT_CORE_BASE_URL "$CORE_BASE_URL"
+            set_env AGENT_RT_WS_BASE "$RT_WS_BASE"
+            # OTLP 端点走 compose 服务名，容器间直连，不出宿主机。
+            # Jaeger 挂了不影响业务：BatchSpanProcessor 只会丢 span 并打日志，
+            # 不会让请求失败，所以这两项用 set_env_optional 而不是硬性 require。
+            set_env_optional AGENT_OTEL_ENABLED "$OTEL_ENABLED"
+            set_env_optional AGENT_OTEL_EXPORTER_OTLP_ENDPOINT "$OTEL_ENDPOINT"
+            diagnostics() {
+              sudo docker compose -p app ps || true
+              sudo docker compose -p app logs --tail=160 agent-runtime || true
+            }
+            wait_for_endpoint() {
+              endpoint="$1"
+              attempts=0
+              until curl --fail --silent --show-error --max-time 5 "$endpoint" >/dev/null; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 12 ]; then
+                  diagnostics
+                  return 1
+                fi
+                sleep 5
+              done
+            }
+            sudo docker compose -p app build agent-runtime
+            # Validate the newly built image without replacing the currently
+            # running service. A bad credential therefore cannot take staging down.
+            #
+            # 代价是：这一步失败时 up -d 不会执行，新代码不上线，而 /healthz 仍由
+            # 旧容器答 ok —— 不把后果写出来，下次还会误判成「部署了但坏了」。
+            if ! sudo docker compose -p app run --rm --no-deps agent-runtime \
+                 python -m app.ops.core_credential_preflight; then
+              echo "::error title=凭证预检失败：新代码未上线::新镜像已构建，但 up -d 排在本步之后，staging 仍在运行上一个版本。/healthz 会继续返回 ok（旧容器），这不代表本次合并生效。修好凭证后必须重跑本 job。"
+              exit 1
+            fi
+            if ! sudo docker compose -p app run --rm --no-deps agent-runtime \
+                 python -m app.ops.gemini_live_preflight; then
+              echo "::error title=Gemini Live v1beta 预检失败：新代码未上线::签票或 Constrained WebSocket setupComplete 未通过，staging 仍运行上一个版本。修复 Google 项目、模型或凭证后重跑本 job。"
+              exit 1
+            fi
+            sudo docker compose -p app up -d --no-build
+            echo "::notice title=新镜像已上线::容器已按本次提交重建。后续检查若失败，属于上线后的校验问题，新代码本身已经在跑。"
+            wait_for_endpoint http://127.0.0.1:8081/healthz
+            sudo docker compose -p app exec -T agent-runtime \
+              python -c "from app.config import Settings; Settings()"
+            wait_for_endpoint http://127.0.0.1:8081/readyz
+            sudo docker compose -p app exec -T agent-runtime python - <<'PY'
+            import asyncio
+            import json
+
+            import httpx
+
+            from app.config import Settings
+            from app.tools.agentos.client import AgentOsStagingClient
+            from app.tools.agentos.trade_flow import parse_market_catalog
+            from app.tools.core_client import HttpCoreClient
+
+
+            async def verify_read_only_core() -> None:
+                settings = Settings()
+                async with httpx.AsyncClient(timeout=8.0) as http:
+                    response = await HttpCoreClient(
+                        settings.core_base_url,
+                        http,
+                        actor_token=settings.core_actor_token,
+                        timeout_seconds=settings.core_timeout_seconds,
+                    ).get_market_tickers(["BTC", "ETH"])
+                    agentos = AgentOsStagingClient(
+                        settings.core_base_url,
+                        settings.core_actor_token,
+                        http,
+                    )
+                    catalog_response = await agentos.get_market_catalog(limit=100)
+                    catalog = parse_market_catalog(catalog_response)
+                    if not catalog:
+                        raise RuntimeError("read-only Core preflight found an empty Market Catalog")
+                print(
+                    "core_market_data_verified="
+                    + json.dumps(
+                        {
+                            "symbols": [ticker.symbol for ticker in response.data],
+                            "source": response.meta.source,
+                            "environment": response.meta.environment,
+                            "as_of": response.meta.as_of,
+                            "stale": response.meta.stale or any(
+                                ticker.stale for ticker in response.data
+                            ),
+                            "decimal_python_types": sorted(
+                                {type(ticker.mark_price).__name__ for ticker in response.data}
+                            ),
+                            "request_id": response.request_id,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                print(
+                    "core_market_catalog_verified="
+                    + json.dumps(
+                        {
+                            "formal_path": "/internal/v1/markets",
+                            "count": len(catalog),
+                            "market_types": sorted({item.market_type for item in catalog}),
+                            "venues": sorted({item.venue for item in catalog}),
+                            "environments": sorted({item.environment for item in catalog}),
+                            "instrument_ids": sorted(item.instrument_id for item in catalog),
+                            "all_trade_supported": all(
+                                item.trade_supported for item in catalog
+                            ),
+                            "all_fresh": not any(item.stale for item in catalog),
+                            "request_id": str(catalog_response.get("request_id") or "")[:128],
+                            "write_performed": False,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+
+
+            asyncio.run(verify_read_only_core())
+            PY
+            container_id="$(sudo docker compose -p app ps -q agent-runtime)"
+            test -n "$container_id"
+            sudo docker inspect --format 'deployed_image_id={{.Image}}' "$container_id"
+            ln -sfnT "$release_dir" /home/sxy/current

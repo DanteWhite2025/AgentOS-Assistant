@@ -1,0 +1,17 @@
+name: Dump Staging Logs
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump Docker Logs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 174.138.21.66
+          username: sxy
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          script: |
+            sudo docker compose -p app logs --tail=300 agent-runtime
+

@@ -1,0 +1,50 @@
+{
+  "results": {
+    "articles": [
+      {
+        "category": "market",
+        "content": "BTC 隔夜大涨，突破 6.9 万美元关口。<p><b>看涨观点</b>：机构资金持续流入。</p>",
+        "provenance": "feeds",
+        "published_ts": 1787190519312,
+        "source_lang": "zh",
+        "source_name": "cointelegraph",
+        "source_quality": "media",
+        "source_url": "https://cointelegraph.com/markets/bitcoin-price-reaches-725k",
+        "title": "Bitcoin price reaches 72.5k as inflows accelerate"
+      },
+      {
+        "category": "fundamentals",
+        "content": "英伟达发布新一代算力芯片，数据中心营收指引上调。",
+        "provenance": "feeds",
+        "published_ts": 1787190526095,
+        "source_lang": "en",
+        "source_name": "benzinga",
+        "source_quality": "media",
+        "source_url": "https://www.benzinga.com/trading-ideas/movers/26/08/61335604/nvda",
+        "title": "Nvidia lifts data center guidance"
+      }
+    ],
+    "social": [
+      {
+        "category": "",
+        "content": "Maya protocol exploit drains about 11M via six-flaw chain.",
+        "kol_info": {"name": "muur_posts@telegram"},
+        "provenance": "tg_kol_feeds",
+        "published_ts": 1787242029793,
+        "source_lang": "en",
+        "source_name": "muur_posts@telegram",
+        "source_quality": "social",
+        "source_url": "https://twitter.com/CryptoKaleo/status/2090469542128742910",
+        "title": ""
+      }
+    ]
+  },
+  "meta": {
+    "mode": "search",
+    "quota": {"consumed": 0, "used": 0, "limit": 100, "remaining": 100},
+    "request_id": "07b924562f6c2f865d631384759e05ac",
+    "status": "ok",
+    "total": 3,
+    "verbosity": "standard"
+  }
+}

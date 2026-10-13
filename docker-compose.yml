@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  agent-runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-runtime
+    ports:
+      - "8081:8080"
+    env_file:
+      - .env
+    environment:
+      - AGENT_ENV=staging
+      - AGENT_APP_NAME=agent-runtime
+      - AGENT_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - jaeger
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent-runtime-redis
+    # 绑回环。这个发布端口只给宿主机上的 redis-cli 排查用 —— 应用走 compose
+    # 网络的 redis://redis:6379/0，根本不经过它。
+    #
+    # 之前绑 0.0.0.0 是实打实的暴露：requirepass 为空、protected-mode=no，
+    # 从公网直连 174.138.21.66:6380 可以成功握手，也就是任何人都能读写 session
+    # 或 FLUSHALL。收回环是止血；后续再考虑加 requirepass 做纵深防御。
+    ports:
+      - "127.0.0.1:6380:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # OpenTelemetry 链路收集器 + Web UI。Runtime 通过 compose 网络内的
+  # http://jaeger:4318/v1/traces 上报，不经公网。
+  #
+  # 端口一律绑 127.0.0.1：Jaeger UI 没有任何鉴权，而链路里带着
+  # unified_account_id、request_id、下游 URL 与查询参数 —— 暴露到 0.0.0.0
+  # 等于把这些直接摊在公网上。看板走 SSH 隧道：
+  #   ssh -L 16686:127.0.0.1:16686 sxy@174.138.21.66
+  #
+  # 镜像钉死小版本：latest 目前指向 v1.x，Jaeger v2 换成了配置文件驱动，
+  # 跟这里的环境变量不兼容，跟着 latest 漂会在某次拉取后直接起不来。
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: agent-runtime-jaeger
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16686:16686"    # Web UI（SSH 隧道访问）
+      - "127.0.0.1:4318:4318"      # OTLP HTTP，仅供宿主机排查；容器间走服务名
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      # all-in-one 是纯内存存储，不封顶会把 staging（共 4G）吃满。
+      - MEMORY_MAX_TRACES=20000
+      - SPAN_STORAGE_TYPE=memory

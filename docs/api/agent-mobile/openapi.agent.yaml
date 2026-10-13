@@ -1,0 +1,1108 @@
+openapi: 3.1.0
+info:
+  title: YesUP Agent Runtime — Mobile Control-Plane API
+  version: "1.5.0"
+  description: |
+    移动端 ↔ agent-runtime 的 **控制面 REST 契约**。Mobile 传入 Core USER Bearer
+    Token；Runtime 不自行解析 Token，而是原样转发到 Core
+    `/api/v1/me/actor-context`，并只信任 Core 返回的规范化 USER 身份。
+    实时通道（文本 WS、语音 WebRTC）不在本 OpenAPI 内，分别见 ws-events.md / voice-webrtc.md。
+
+    约定：时间 UTC ISO 8601；金额字符串 Decimal；写请求支持 Idempotency-Key；统一错误信封。
+    Session 归属由 Core 返回的 user_id 决定。不存在和跨用户访问统一返回
+    404 SESSION_NOT_FOUND，避免泄露其他用户的 Session 标识。
+    域名为约定占位值，待 DevOps 确认（TBD）。注意：/tool-calls 直连 agent-runtime（{RT_BASE}），其余端点经 BFF（{BFF_BASE}）。
+servers:
+  - url: https://api.yesup.io
+    description: production · 控制面经 Mobile BFF（域名 TBD，待 DevOps 确认）
+  - url: https://staging-api.yesup.io
+    description: staging（TBD）
+  - url: http://localhost:8080
+    description: local（BFF）
+
+security:
+  - coreUserBearer: []
+
+paths:
+  /readyz:
+    get:
+      security: []
+      operationId: getRuntimeReadiness
+      summary: 读取 Runtime 依赖就绪缓存
+      description: |
+        本接口不直接请求 Core，而是返回启动时验证、后台周期重验所得的缓存。
+        Core AGENT Token 缺失、过期、被 Core 拒绝、actor/agent_id 不匹配、缺少
+        `market:read,account:read,trade:draft`、含禁止高权限 Scope，或 Core 暂不可用时，
+        均返回 503 `status=not_ready`。`/healthz` 的 200 不能替代本检查，也不能证明语音 E2E。
+      responses:
+        '200':
+          description: Runtime 依赖已真实验证
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Core credential 或上游依赖未就绪
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /v1/agent/sessions:
+    post:
+      operationId: createSession
+      summary: 创建 Agent 会话，返回凭证包与实时通道 endpoints
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionCreateRequest' }
+      responses:
+        '201':
+          description: 会话已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionCredentials' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/sessions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: getSession
+      summary: 查询会话状态（WS 重连后补齐状态用）
+      responses:
+        '200':
+          description: 会话状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionState' }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: closeSession
+      summary: 结束会话
+      responses:
+        '204': { description: 已关闭 }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/sessions/{id}/token:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: refreshToken
+      summary: 续签短期凭证（rt_token 与/或 voice Token）
+      description: |
+        用于两种场景：
+        1. rt_token 临近过期时刷新文本流/旁挂凭证；
+        2. **火山 RTC Token 即将过期/断线重连**：App 先调本接口拿新 Token，再调用 SDK updateToken 或重新进房。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                want:
+                  type: array
+                  description: 需要刷新的凭证类型，默认两者都刷
+                  items: { type: string, enum: [rt_token, voice] }
+      responses:
+        '200':
+          description: 新凭证
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefreshedCredentials' }
+        '404': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/sessions/{id}/voice/start:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: startVoiceChat
+      summary: 客户端成功加入 RTC 房间后启动 AI 对话任务
+      description: 幂等调用；HTTP 200 只表示异步任务已被接受。仅服务端房间成员查询发现 bot_user_id 后才会 voice_ready。
+      responses:
+        '200':
+          description: AI 对话任务已提交，等待异步状态回调
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, state, trace_id]
+                properties:
+                  session_id: { type: string }
+                  state: { type: string, enum: [task_accepted, bot_joining, voice_ready] }
+                  trace_id: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/volc-callback:
+    post:
+      security: []
+      operationId: receiveVolcVoiceEvent
+      summary: 火山 VoiceChat 异步状态回调（Provider 专用）
+      description: |
+        支持火山官方 message/binary/signature 二进制信封和旧版受限 JSON 层级。
+        session_id 与当前 Voice Task 派生签名绑定 active attempt；回调携带的
+        AppId/RoomId/TaskId 必须逐项匹配。停止后的合法延迟回调幂等返回 200。
+      parameters:
+        - in: query
+          name: session_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: 已安全接收 }
+        '400': { description: 回调 schema 非法或明确身份字段不匹配 }
+        '401': { description: 回调签名无效 }
+
+  /v1/agent/volc-function-callback:
+    post:
+      security: []
+      operationId: receiveVolcFunctionCall
+      summary: 火山 VoiceChat Function Calling 独立回调
+      description: |
+        使用独立 Function Callback Secret 做常量时间校验，严格校验
+        session_id/AppId/RoomId/ToolCallID/tool name/arguments。Function Callback 的
+        TaskID 是函数调用任务 ID，不与 VoiceChat TaskId 混用；当前 VoiceChat Task 由
+        session 派生签名和 active attempt 绑定。工具仍经 session.scope.tools 二次校验；
+        重复 ToolCallID 幂等，旧 attempt 不得修改新会话。
+      parameters:
+        - in: query
+          name: session_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: 工具结果已通过 UpdateVoiceChat 回灌，或重复调用已处理 }
+        '400': { description: 身份字段或 arguments 无效 }
+        '401': { description: Function Callback 签名无效 }
+        '403': { description: 工具不在 Session scope }
+        '409': { description: Session 已停止或 callback 属于旧 Task }
+        '413': { description: 请求体过大 }
+        '502': { description: UpdateVoiceChat 回灌失败，未伪造成功 }
+
+  /v1/agent/sessions/{id}/tool-calls:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      security:
+        - runtimeToken: []
+      operationId: relayToolCall
+      summary: 语音工具旁挂执行（App 转发 OpenAI 的 function_call 给 RT）
+      description: |
+        **此端点直连 agent-runtime（{RT_BASE}），不经 BFF。** 用 rt_token 鉴权。
+        语音场景下 OpenAI 经 data channel 把 function_call 发给 App，App **不执行**，
+        而是通过本接口转交 RT 执行，RT 调用 yesup-core 后返回结果，App 再回灌 OpenAI。
+
+        **安全——服务端工具白名单二次校验（强制）**：
+        RT 收到请求后，必须依据 `session_id` 关联的 `scope.tools` **重新强校验** `tool_name` 是否合法，
+        **绝不信任客户端上报的工具名**。不在白名单 → 返回 403 `TOOL_NOT_IN_SCOPE`，App 据此向 OpenAI 回灌错误 payload。
+        RT 同时对参数做 JSON Schema 校验；写工具只允许创建 TradeDraft，不得触发真实执行。
+
+        **超时**：本接口内部调用 yesup-core 若超时，返回 504 `TOOL_UPSTREAM_TIMEOUT`；
+        客户端侧的旁挂超时与错误回灌兜底见 voice-webrtc.md §2（建议 App 端 5~8s 超时）。
+        Runtime AGENT Token 失效属于服务凭证故障，不是 Mobile USER 登录失效；统一返回
+        503 `INTERNAL` 和“智能体服务凭证暂不可用”，不得把 Core 401 透传为用户 401。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ToolCallRequest' }
+      responses:
+        '200':
+          description: 工具执行结果（回灌 OpenAI 用）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ToolCallResult' }
+        '403':
+          description: 工具不在会话白名单（二次校验拒绝）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+        '504':
+          description: 调用 yesup-core 超时
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/agent/messages:
+    post:
+      operationId: postMessage
+      summary: 文本单轮（非流式，简单场景；主路径请用文本 WS）
+      description: |
+        Authorization 中的 Core USER Token 仅在本次请求内转发给
+        GET /api/v1/me/trading-readiness，用于解析当前用户的统一账户、Venue Margin、
+        Agent Trading Account、Mandate 与 Strategy Binding；账户摘要同样透传该 USER
+        Token，使用其中规范化的 unified_account_id 读取 GET /api/v1/me/account-summary，
+        不使用静态 Agent Token 访问内部 /internal/v1/account-summary，也不使用 user_id
+        猜账户，Token 不写入 Session。额度结果分别返回 Venue Margin、Capital、单笔、总敞口和
+        日额度维度。Core 没有权威 Venue Equity 或总敞口剩余字段时明确返回
+        NOT_AVAILABLE，不从 Ledger balance、positions 或 orders 推算。
+        只查询行情和额度不会创建 Draft。明确要求生成计划时，Runtime 使用
+        agent-test-001 与 strategy_btc_limit_v1 创建一个 ALWAYS_CONFIRM Core Draft，
+        返回 core_draft_id，但绝不确认或请求执行。
+        所有 PERP 行情参数（包括 BTCUSDC、BTC-USDC、BTC/USDC）先解析为唯一的
+        Core Market Catalog Instrument，实际行情请求只使用 Catalog venue_symbol；无唯一
+        匹配、不可交易或 Catalog stale 时 fail-closed。相同 Idempotency-Key 的相同消息
+        只执行一次，成功结果写入 Session 的脱敏恢复记录；Mobile 超时后使用相同请求和
+        Idempotency-Key 重试会得到原 trace_id/core_draft_id，不会再次创建 Draft。
+
+        「单轮」指的是请求形态（一问一答、非流式），不代表没有上下文：同一
+        session_id 的连续请求会自动带上本会话最近几轮的问答，用于理解「他」
+        「该基金」这类指代。客户端**不需要**自己上传历史，请求体里也没有这个
+        字段。历史随 Session 过期（1 小时）一起失效。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SingleTurnRequest' }
+      responses:
+        '200':
+          description: 单轮回复
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SingleTurnResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/trade-draft:
+    post:
+      operationId: createTradeDraftCard
+      summary: 在 Core StrategyBinding 下创建交易草稿，不代用户确认
+      description: |
+        Mobile 只提交 session_id、strategy_id 和自然语言意图。Runtime 先用本次请求的
+        Core USER Token 读取正式 Trading Readiness，再使用自身的 AGENT Token 精确解析
+        StrategyBinding，并交叉校验账户、Venue 和 Mandate；不接受 Mobile 自报这些关系。
+        USER Token 不持久化。Core V1 仍为 ALWAYS_CONFIRM。Runtime 不实现 confirm、
+        request-execution 或 Step-Up Token 透传；后续确认只能由 Mobile 直连 Core USER API。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TradeDraftCardRequest' }
+      responses:
+        '201':
+          description: 草稿与用户确认卡片
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TradeDraftCard' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/sessions/{id}/history:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      operationId: getHistory
+      deprecated: true
+      summary: '[审计] 单会话的工具调用记录 —— 不是对话历史'
+      description: |
+        **命名有误导性，移动端请勿用于「历史对话」功能。**
+
+        本接口返回的是该 Session 的**工具调用审计记录**（tool_name / args_hash /
+        result_ref），不是用户与 AI 的对话消息。且 `cursor` 参数当前未实现，
+        `next_cursor` 恒为 `null`，`limit` 仅做截断。
+
+        历史对话请改用 `/v1/agent/conversations` 系列接口：
+        - 会话列表 → `GET /v1/agent/conversations`
+        - 对话回放 → `GET /v1/agent/conversations/{conversation_id}/messages`
+        - 继续提问 → `POST /v1/agent/conversations/{conversation_id}/resume`
+      parameters:
+        - { name: cursor, in: query, required: false, description: '当前未实现，传了也不生效', schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: 历史消息页
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoryPage' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: archiveTranscript
+      summary: 异步归档语音字幕（App 收到 transcript done 后上报）
+      description: |
+        见 README §7 语音 Transcript 归档策略。`source=voice` 表示来自语音通道。
+
+        **这是语音会话进入历史列表的唯一入口，不再是「可选」的。** 服务端从
+        provider 侧拿不到转写正文（回调解析器刻意不保留），所以 App 不上报的
+        那通语音就不会出现在 `/v1/agent/conversations` 里。
+
+        字幕会被收敛成成对轮次后落库：
+        - 同一角色连续多条会拼成一条（一句话被 ASR 按停顿切开不算多轮）
+        - 被打断的回答记下打断前实际说出的内容
+        - 用户问了而 AI 未开口的那一轮，答案侧记空串
+        - 空串与纯空白直接丢弃
+
+        **重传是安全的。** 去重靠 `(role, text, started_at)`，重发同一批不会
+        产生重复历史。因此请**带上 `started_at`**：缺失时会退化为服务端接收
+        时间，重传就无法识别，且同一批字幕会挤在同一时刻、影响回放顺序。
+
+        归档失败不影响 `202` —— 本端点的本职是上报语音证据时间戳。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TranscriptArchiveRequest' }
+      responses:
+        '202': { description: 已受理归档 }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/audio/transcribe:
+    post:
+      operationId: transcribeAudio
+      summary: 上传短语音，返回火山豆包 Seed ASR Flash 识别出的文字
+      description: |
+        端侧本地识别（如 iOS Speech API）对中文与币圈专有名词（BTC、滑点、做多做空……）
+        识别率差，短语音改走服务端同步识别一次拿到准确文字。**只适合几秒到几十秒的
+        短语音**——整段音频一次上传，不是流式；需要边说边出字的打字机体验请走
+        `WSS /v1/agent/audio/stream`（见 ws-events.md §7，不在本 OpenAPI 契约内）。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 音频文件，≤10MB；支持 .m4a / .wav / .mp3 / .aac / .ogg / .pcm
+      responses:
+        '200':
+          description: 识别结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudioTranscribeResponse' }
+        '400':
+          description: 文件为空、扩展名不受支持或超过 10MB
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Error' }
+        '502':
+          description: 上游超时或 5xx，受控重试 1 次后仍失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/agent/conversations:
+    get:
+      operationId: listConversations
+      summary: 历史会话列表（cursor 分页）
+      description: |
+        返回当前用户的历史对话，按最后活跃时间倒序。用于「历史」弹窗。
+
+        与 `/v1/agent/sessions` 的区别：`conversation` 是**持久化记录**（保留 30 天），
+        `session` 是**运行时对象**（Redis TTL 1 小时）。列表里的 `conversation_id`
+        取值等同于当时的 `session_id`，但不能直接拿去连 WebSocket —— 该 Session
+        大概率已过期。要继续提问，先调 `POST /conversations/{id}/resume`。
+
+        `title` 恒非空：首轮落库时先写用户首句截断值，LLM 生成完成后自动升级为
+        语义标题（如「BTC行情分析」）。客户端无需处理 `null`，也无需为标题变化做特殊处理。
+
+        本期只收录文本会话，语音会话不入列表。
+      parameters:
+        - { name: cursor, in: query, required: false, description: 上一页返回的 next_cursor，不透明值，勿当 offset 用, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, minimum: 1, maximum: 50 } }
+      responses:
+        '200':
+          description: 会话列表页
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/conversations/{conversation_id}:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    delete:
+      operationId: deleteConversation
+      summary: 删除历史会话（真删，不可恢复）
+      description: |
+        物理删除该会话及其全部消息，**不可恢复**，没有回收站。
+
+        同时会关闭对应的运行时会话。这一点是必要的：会话行是首轮落库时
+        懒创建的，若只删历史而留着运行时会话，用户继续聊时会话行会被重新
+        建出来，表现成「删掉的历史又回来了」。
+
+        绝大多数删除发生在运行时会话早已过期之后（Redis TTL 1 小时），
+        此时关闭是 no-op，不影响结果。
+
+        不存在与跨用户访问统一返回 404。重复删除第二次即 404。
+      responses:
+        '204': { description: 已删除 }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: renameConversation
+      summary: 重命名历史会话
+      description: |
+        改标题。两侧空白会被去掉；纯空白与超过 200 字符一律 422。
+
+        用户改名后，**异步的自动标题生成不会再覆盖它** —— 标题生成要 1.5~3
+        分钟，服务端用条件更新（仅当标题仍是建行时的降级值才写）保证用户
+        意图优先，客户端无需为此做任何处理。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationRenameRequest' }
+      responses:
+        '200':
+          description: 改名后的会话
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationSummary' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/conversations/{conversation_id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      operationId: listConversationMessages
+      summary: 历史对话回放（cursor 分页，正序）
+      description: |
+        按时间**正序**返回该会话的完整对话正文，用于回放。
+
+        注意：这里返回的是完整历史，但 resume 后 AI 只会「记得」最近 3 轮
+        —— UI 全量展示，模型聚焦近期上下文，以避免过期行情数据引发幻觉。
+
+        不存在与跨用户访问统一返回 404，避免泄露其他用户的会话标识。
+      parameters:
+        - { name: cursor, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, minimum: 1, maximum: 50 } }
+      responses:
+        '200':
+          description: 对话消息页
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessagePage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/conversations/{conversation_id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    post:
+      operationId: resumeConversation
+      summary: 从历史会话继续提问（重建运行时会话并换发凭证）
+      description: |
+        把一条历史对话恢复成可用的运行时会话，返回与 `POST /v1/agent/sessions`
+        **完全相同**的 `SessionCredentials`，客户端可复用既有处理逻辑。
+
+        行为：
+        - Runtime 侧会话仍存活 → 复用，不重建、不重复灌历史
+        - 已过期 → 从持久化记录取最近 3 轮重建
+
+        **无论哪种情况都会换发新的 `rt_token`。** `rt_token` 有效期仅 5 分钟，
+        而会话存活期是 1 小时，因此复用分支下旧 token 基本必然已过期 ——
+        客户端务必用本接口返回的新 token 去连 WebSocket，不要沿用旧值。
+
+        续聊内容会追加进**同一条** conversation，用户看到的是连续的一条历史。
+
+        幂等性：幂等的是会话状态（不会重建已存在的会话、不会重复灌历史），
+        **不是返回值** —— 每次调用都返回新的 `rt_token`，这是预期行为。
+
+        工具白名单按当前策略重新计算，不从历史快照恢复。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionCreateRequest' }
+      responses:
+        '200':
+          description: 会话已恢复，返回新凭证包
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionCredentials' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/agent/hotspots/daily:
+    get:
+      security: []
+      operationId: getDailyHotspots
+      summary: 每日热点早报（今日要闻摘要 + 推荐追问议题）
+      description: |
+        无需 Core USER Token（公开只读端点，按对端 IP 限流）。主动提炼近期新闻为
+        一条今日核心行情摘要 + 6~9 张可点击的追问议题卡片（供前端首页「换一换」
+        无感轮换与二级列表页完整浏览，按 3 个一组分页切组），用于替换首屏呆板的
+        「你想看哪只股票/币」问答模板。`suggested_actions[].prompt` 可直接作为
+        `user.message` 的 `text` 发给 WS 通道，触发 Agent 深入分析（可能调用
+        `ask_investment_expert` 工具）。服务端内存缓存默认 1800s，响应
+        `Cache-Control: no-store`（不让 App/CDN 把过期早报再锁 30 分钟）。
+        有旧结果时不占 IP 限流；LLM 失败则继续返回上一份成功结果。
+      responses:
+        '200':
+          description: 早报摘要
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HotspotDigest' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+components:
+  securitySchemes:
+    coreUserBearer:
+      type: http
+      scheme: bearer
+      description: Core USER Token；Runtime 原样转发给 Core actor-context，不在本地解析
+    runtimeToken:
+      type: http
+      scheme: bearer
+      description: Runtime 签发的短期 rt_token，绑定 session_id 与 Core 规范化 user_id
+
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, example: sess_01J8XY... }
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      description: 历史会话标识。取值等同于当时的 session_id，但指向持久化记录而非运行时会话
+      schema: { type: string, example: sess_01J8XY... }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        消息或 Draft 操作的稳定恢复键。相同键只能用于同一请求；重试返回已完成结果，
+        不重复调用模型或创建 Draft。Runtime 仅持久化键的 SHA-256，不保存原值。
+      schema: { type: string, maxLength: 256 }
+
+  responses:
+    Error:
+      description: 统一错误信封
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    Readiness:
+      type: object
+      required: [status, service, env, provider_mode, core_credential, voice_e2e_verified]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        service: { type: string }
+        env: { type: string }
+        provider_mode: { type: string, enum: [fake, real] }
+        realtime_voice_provider: { type: string }
+        voice_function_calling_configured: { type: boolean }
+        core_market_data_client_configured: { type: boolean }
+        voice_e2e_verified: { type: boolean, const: false }
+        core_credential:
+          type: object
+          required:
+            - status
+            - valid
+            - core_verified
+            - actor_type_valid
+            - agent_id_valid
+            - scopes_valid
+            - forbidden_scopes_absent
+            - expiring_soon
+          properties:
+            status:
+              type: string
+              enum: [not_applicable, not_checked, valid, missing, malformed, expired, actor_type_mismatch, agent_id_mismatch, scope_missing, forbidden_scope, core_rejected, core_forbidden, core_unavailable, core_preflight_failed]
+            valid: { type: boolean }
+            core_verified: { type: boolean }
+            actor_type_valid: { type: boolean }
+            agent_id_valid: { type: boolean }
+            scopes_valid: { type: boolean }
+            forbidden_scopes_absent: { type: boolean }
+            expiring_soon: { type: boolean }
+            expires_in_seconds: { type: [integer, 'null'] }
+            core_request_id: { type: [string, 'null'] }
+            last_verified_at: { type: [string, 'null'], format: date-time }
+
+    SessionCreateRequest:
+      type: object
+      required: [modality]
+      properties:
+        modality:
+          type: string
+          enum: [text, voice, both]
+          description: 期望的初始交互形态
+        locale: { type: string, example: zh-CN }
+        client_info:
+          type: object
+          properties:
+            platform: { type: string, enum: [ios, android] }
+            app_version: { type: string }
+
+    SessionCredentials:
+      type: object
+      required: [session_id, rt_token, rt_token_expires_at, ws_url, scope, trace_id]
+      properties:
+        session_id: { type: string }
+        rt_token:
+          type: string
+          description: 短期签名 Token（默认 ~5min），绑定 session_id 与规范化 user_id，用于文本 WS 与工具旁挂
+        rt_token_expires_at: { type: string, format: date-time }
+        ws_url: { type: string, format: uri }
+        voice: { $ref: '#/components/schemas/VoiceCredentials' }
+        scope: { $ref: '#/components/schemas/AgentScope' }
+        trace_id: { type: string }
+
+    VoiceCredentials:
+      type: object
+      description: 仅在 modality 含 voice 时返回；Gemini Live 使用 v1beta Constrained WSS
+      required: [provider]
+      properties:
+        provider: { type: string, enum: [fake, openai, volc_rtc, gemini_live] }
+        endpoint_url:
+          type: string
+          format: uri
+          description: 客户端媒体直连端点；Gemini 必须为 v1beta BidiGenerateContentConstrained 且不含凭证
+        expires_at: { type: string, format: date-time }
+        allowed_tools:
+          type: array
+          items: { type: string }
+          description: 服务端批准并锁进短期票的只读工具白名单
+        client_secret:
+          type: string
+          description: OpenAI ephemeral token（短期），只签发给通过 Core USER 鉴权且拥有 Session 的用户
+        client_secret_expires_at: { type: string, format: date-time }
+        new_session_expires_at:
+          type: string
+          format: date-time
+          description: Gemini 临时票仍可用于建立新 Live Session 的截止时间
+        model: { type: string, example: gemini-3.1-flash-live-preview }
+        call_url: { type: string, format: uri, example: https://api.openai.com/v1/realtime/calls }
+        app_id: { type: string, description: 火山 RTC 公共 AppId }
+        room_id: { type: string }
+        user_id: { type: string }
+        token: { type: string, description: 短期 RTC Token；不包含 AppKey/AK/SK }
+        token_expires_at: { type: string, format: date-time }
+        task_id: { type: string }
+        bot_user_id: { type: string }
+
+    RefreshedCredentials:
+      type: object
+      properties:
+        rt_token: { type: string }
+        rt_token_expires_at: { type: string, format: date-time }
+        voice: { $ref: '#/components/schemas/VoiceCredentials' }
+        trace_id: { type: string }
+
+    AgentScope:
+      type: object
+      description: 会话的 AgentMandate — 工具白名单是唯一权威来源
+      required: [agents, tools]
+      properties:
+        agents:
+          type: array
+          items: { type: string, enum: [avatar, monitor, strategy, fund_manager] }
+        tools:
+          type: array
+          description: 该会话允许调用的工具白名单（RT 二次校验依据）
+          items: { type: string }
+
+    SessionState:
+      type: object
+      properties:
+        session_id: { type: string }
+        state: { type: string, enum: [created, text_active, voice_starting, task_accepted, bot_joining, voice_ready, bot_join_timeout, provider_failed, voice_stopped, closed] }
+        modality: { type: string, enum: [text, voice, both] }
+        created_at: { type: string, format: date-time }
+        last_activity_at: { type: string, format: date-time }
+        scope: { $ref: '#/components/schemas/AgentScope' }
+        voice_error_code:
+          type: [string, 'null']
+          description: 稳定 Runtime 错误码；Stop/close 不清除原始失败
+        voice_error_message:
+          type: [string, 'null']
+          description: UI 安全文案；Provider 细节只在 voice_diagnostics
+        voice_run_stage: { type: [string, 'null'] }
+        voice_provider_request_id: { type: [string, 'null'] }
+        voice_task_submitted_at: { type: [string, 'null'], format: date-time }
+        voice_bot_joined_at: { type: [string, 'null'], format: date-time }
+        voice_task_creation_result:
+          type: [string, 'null']
+          description: StartVoiceChat 的脱敏受理结果；不等于 Bot 已进房
+        voice_callback_received_at: { type: [string, 'null'], format: date-time }
+        voice_stopped_at: { type: [string, 'null'], format: date-time }
+        voice_cleanup_status:
+          type: [string, 'null']
+          enum: [success, failed, null]
+        voice_user_transcript_at: { type: [string, 'null'], format: date-time }
+        voice_assistant_transcript_at: { type: [string, 'null'], format: date-time }
+        voice_provider_audio_started_at: { type: [string, 'null'], format: date-time }
+        voice_interrupted_at: { type: [string, 'null'], format: date-time }
+        voice_diagnostics:
+          anyOf:
+            - { $ref: '#/components/schemas/VoiceDiagnostics' }
+            - { type: 'null' }
+
+    VoiceDiagnostics:
+      type: object
+      description: 脱敏的火山异步任务诊断；UI 不直接展示 Provider 错误
+      properties:
+        original_failure_stage: { type: [string, 'null'] }
+        provider_error_code: { type: [string, 'null'] }
+        provider_error_message: { type: [string, 'null'] }
+        first_failed_at: { type: [string, 'null'], format: date-time }
+        start_request_id: { type: [string, 'null'] }
+        presence_request_id: { type: [string, 'null'] }
+        callback_trace_id: { type: [string, 'null'] }
+        room_hash: { type: [string, 'null'] }
+        mobile_user_hash: { type: [string, 'null'] }
+        bot_user_hash: { type: [string, 'null'] }
+        task_hash: { type: [string, 'null'] }
+        start_requested_at: { type: [string, 'null'], format: date-time }
+        start_accepted_at: { type: [string, 'null'], format: date-time }
+        mobile_joined_at: { type: [string, 'null'], format: date-time }
+        bot_joined_at: { type: [string, 'null'], format: date-time }
+        task_started_at: { type: [string, 'null'], format: date-time }
+        first_provider_callback_at: { type: [string, 'null'], format: date-time }
+        user_audio_status:
+          type: string
+          enum: [UNKNOWN, OBSERVED]
+          description: 只有 Provider 明示收到用户音频时为 OBSERVED；没有对应字段时保持 UNKNOWN
+        asr_started_at: { type: [string, 'null'], format: date-time }
+        user_speech_started_at: { type: [string, 'null'], format: date-time }
+        user_speech_ended_at: { type: [string, 'null'], format: date-time }
+        first_user_transcript_at: { type: [string, 'null'], format: date-time }
+        llm_started_at: { type: [string, 'null'], format: date-time }
+        llm_completed_at: { type: [string, 'null'], format: date-time }
+        assistant_first_token_at: { type: [string, 'null'], format: date-time }
+        function_call_started_at: { type: [string, 'null'], format: date-time }
+        function_call_completed_at: { type: [string, 'null'], format: date-time }
+        function_call_failed_at: { type: [string, 'null'], format: date-time }
+        tts_started_at: { type: [string, 'null'], format: date-time }
+        tts_first_packet_at: { type: [string, 'null'], format: date-time }
+        first_assistant_transcript_at: { type: [string, 'null'], format: date-time }
+        provider_audio_started_at: { type: [string, 'null'], format: date-time }
+        interrupted_at: { type: [string, 'null'], format: date-time }
+        stopped_at: { type: [string, 'null'], format: date-time }
+        cleanup_status:
+          type: [string, 'null']
+          enum: [success, failed, null]
+        callback_schema_hash: { type: [string, 'null'] }
+        callback_received_total: { type: integer, minimum: 0 }
+        callback_accepted_total: { type: integer, minimum: 0 }
+        callback_duplicate_total: { type: integer, minimum: 0 }
+        callback_stale_total: { type: integer, minimum: 0 }
+
+    ToolCallRequest:
+      type: object
+      required: [call_id, tool_name, arguments]
+      properties:
+        call_id:
+          type: string
+          description: OpenAI function_call 的 call_id，用于回灌配对
+        tool_name:
+          type: string
+          description: 客户端上报的工具名（RT 必须按 scope 二次校验，不可信任）
+        arguments:
+          type: object
+          description: 工具参数（RT 做 JSON Schema 校验）
+          additionalProperties: true
+
+    ToolCallResult:
+      type: object
+      required: [call_id, status]
+      properties:
+        call_id: { type: string }
+        status: { type: string, enum: [ok, error] }
+        output:
+          description: 成功时的结构化结果（回灌 OpenAI function_call_output）
+          type: object
+          additionalProperties: true
+        error: { $ref: '#/components/schemas/ErrorEnvelope' }
+        trade_draft_id:
+          type: string
+          description: 若为下单类工具，返回创建的 TradeDraft id（供 App 拉起 core 确认页）
+
+    SingleTurnRequest:
+      type: object
+      required: [session_id, text]
+      properties:
+        session_id: { type: string }
+        text: { type: string }
+        web_search:
+          type: boolean
+          default: false
+          description: 仅对本条消息启用并强制执行联网搜索；发送后由客户端恢复为 false
+
+    TradeDraftCardRequest:
+      type: object
+      additionalProperties: false
+      required: [session_id, strategy_id, text]
+      properties:
+        session_id: { type: string }
+        strategy_id: { type: string, minLength: 3, maxLength: 128 }
+        text:
+          type: string
+          description: 自然语言下单意图；不得包含账户、Mandate 或授权关系
+
+    TradeDraftCard:
+      type: object
+      required: [card, draft, trace_id]
+      properties:
+        card: { type: string }
+        draft_id: { type: [string, 'null'] }
+        core_draft_id:
+          type: [string, 'null']
+          description: Core 返回的真实 Trade Draft id；与 draft_id 相同
+        draft_version: { type: [integer, 'null'] }
+        status: { type: [string, 'null'] }
+        draft: { type: object, additionalProperties: true }
+        trace_id: { type: string }
+
+    SingleTurnResponse:
+      type: object
+      properties:
+        text: { type: string }
+        tool_calls:
+          type: array
+          items: { $ref: '#/components/schemas/ToolCallResult' }
+        blockers:
+          type: array
+          description: >-
+            本轮遇到的内部错误码/原因，供排查用，**不要直接展示给用户**——UI 一律显示 text 里的
+            普通用户说明。可能为空，也可能包含多条：只读工具失败时对话不再中断，每次失败都会
+            在这里留痕后继续作答，因此一轮里可以累积多条（例如行情超时 + 搜索无结果）。
+            早期版本遇到失败即终止本轮，最多只有一条，客户端不要假设长度上限。
+          items: { type: string }
+        trace_id: { type: string }
+
+    HistoryPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryMessage' }
+        next_cursor: { type: string, nullable: true }
+
+    HistoryMessage:
+      type: object
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [user, assistant, tool] }
+        source: { type: string, enum: [text, voice], description: 消息来源通道 }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ConversationPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationSummary' }
+        next_cursor:
+          type: string
+          nullable: true
+          description: 为 null 表示没有下一页
+
+    ConversationSummary:
+      type: object
+      required: [conversation_id, title, modality, created_at, last_message_at, message_count]
+      properties:
+        conversation_id:
+          type: string
+          example: sess_01J8XY...
+          description: 拿它去 resume；不要直接用于 WebSocket 连接
+        title:
+          type: string
+          maxLength: 200
+          example: BTC行情分析
+          description: 恒非空。初始为用户首句截断值，LLM 生成后自动升级为语义标题
+        modality:
+          type: string
+          enum: [text, voice, both]
+          description: >
+            会话形态。text=纯打字，voice=纯语音，both=两者都用过（只升不降）。
+            可用于在列表里给语音会话加图标区分。
+        created_at: { type: string, format: date-time }
+        last_message_at:
+          type: string
+          format: date-time
+          description: 列表排序键（倒序）
+        message_count:
+          type: integer
+          description: 消息条数，一问一答计 2 条
+
+    ConversationRenameRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          example: 我的持仓分析
+          description: 两侧空白会被去掉；纯空白视为非法（422）
+
+    ConversationMessagePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationMessage' }
+        next_cursor: { type: string, nullable: true }
+
+    ConversationMessage:
+      type: object
+      required: [id, role, content, created_at]
+      properties:
+        id: { type: string }
+        role:
+          type: string
+          enum: [user, assistant]
+          description: 无 tool 角色 —— 工具调用不进对话历史
+        content:
+          type: string
+          description: 已剥离追问 chips 的正文
+        created_at: { type: string, format: date-time }
+
+    TranscriptArchiveRequest:
+      type: object
+      required: [source, turns]
+      properties:
+        source: { type: string, enum: [voice] }
+        turns:
+          type: array
+          description: App 在收到 transcript done 后异步批量上报；Runtime Session 只保存角色已出现的时间证据，不保存完整内容
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              text: { type: string }
+              started_at: { type: string, format: date-time }
+              ended_at: { type: string, format: date-time }
+
+    HotspotDigest:
+      type: object
+      required: [headline, summary, suggested_actions]
+      properties:
+        headline: { type: string, example: 今日核心行情速递 }
+        summary:
+          type: string
+          description: 编号列出的 2~4 条当日市场要闻/大盘动态
+          example: |
+            1. 美联储维持利率不变
+            2. BTC 突破关键阻力位
+        suggested_actions:
+          type: array
+          description: 6~9 个议题，供前端按 3 个一组分页切组展示
+          items: { $ref: '#/components/schemas/SuggestedAction' }
+
+    SuggestedAction:
+      type: object
+      required: [label, prompt]
+      properties:
+        label: { type: string, description: 卡片展示文案，带一个 emoji, example: 🔥 深度分析英伟达财报 }
+        prompt:
+          type: string
+          description: 点击卡片后直接作为 user.message.text 发送的完整提问
+          example: 结合最新财报深度分析英伟达后续走势
+
+    AudioTranscribeResponse:
+      type: object
+      required: [transcript, duration_ms, trace_id]
+      properties:
+        transcript: { type: string, example: 帮我查看一下当前比特币价格和我的持仓 }
+        duration_ms:
+          type: integer
+          description: 识别音频的时长（毫秒），上游未回传时为 0
+          example: 1250
+        trace_id: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      required: [code, message, trace_id]
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - UNAUTHENTICATED
+            - FORBIDDEN
+            - AUTH_UPSTREAM_UNAVAILABLE
+            - UNAUTHORIZED
+            - TOOL_NOT_IN_SCOPE
+            - SESSION_NOT_FOUND
+            - IDEMPOTENCY_CONFLICT
+            - SESSION_EXPIRED
+            - RATE_LIMITED
+            - INTERNAL
+            - TOOL_UPSTREAM_TIMEOUT
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
+        trace_id: { type: string }

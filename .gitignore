@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# venv
+.venv/
+venv/
+
+# env & secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# OS
+.DS_Store
+
+# Demos & Temporary
+demo/
+
+evaluations/reports/

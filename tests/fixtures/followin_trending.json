@@ -1,0 +1,33 @@
+{
+  "results": {
+    "articles": [
+      {
+        "asset_type": "crypto",
+        "asset_types": ["BTC"],
+        "category": "majorcoin",
+        "content": "发生了什么？\nBTC 突破 71500，创 6 月以来新高。",
+        "provenance": "followin_trending",
+        "published_ts": 1787190519312,
+        "source_quality": "media",
+        "title": "BTC continued its upward trend, breaking through 71500"
+      },
+      {
+        "asset_type": "crypto",
+        "asset_types": ["牛来", "BSC", "MEME"],
+        "category": "majorcoin",
+        "content": "BSC 链上的 Meme 币市值短时突破 6000 万美元。",
+        "provenance": "followin_trending",
+        "published_ts": 1787215718515,
+        "source_quality": "media",
+        "title": "Niu Lai Meme market value surpasses 52 million"
+      }
+    ]
+  },
+  "meta": {
+    "mode": "search",
+    "quota": {"consumed": 0, "used": 0, "limit": 100, "remaining": 100},
+    "status": "ok",
+    "total": 2,
+    "verbosity": "standard"
+  }
+}
